@@ -1,0 +1,339 @@
+stages:
+  - prepare
+  - build
+  - release
+
+workflow:
+  rules:
+    - if: $CI_API_V4_URL == 'https://ops.gitlab.net/api/v4' && $ENABLE_OPS_PIPELINE != 'true'
+      when: never
+    - when: always
+
+default:
+  image: registry.gitlab.com/gitlab-org/gitlab-build-images:gitlab-vscode-build
+  tags:
+    - gitlab-org
+  interruptible: true # All jobs are interruptible by default
+  retry:
+    max: 2 # This is confusing but this means "3 runs at max".
+    when:
+      - unknown_failure
+      - api_failure
+      - runner_system_failure
+      - job_execution_timeout
+      - stuck_or_timeout_failure
+
+variables:
+  ### PERFORMANCE ###
+  # GIT_* variables to speed up repo cloning/fetching
+  GIT_DEPTH: "10"
+  GIT_STRATEGY: "fetch"
+  GIT_SUBMODULE_STRATEGY: "none"
+  # Disabling LFS speeds up jobs, because runners don't have to perform the LFS steps during repo clone/fetch
+  GIT_LFS_SKIP_SMUDGE: "1"
+  # NO_CONTRACTS speeds up middleman builds
+  NO_CONTRACTS: "true"
+
+  ### RELIABILITY ###
+  # Reduce flaky builds via https://docs.gitlab.com/ee/ci/runners/configure_runners.html#job-stages-attempts variables
+  GET_SOURCES_ATTEMPTS: "3"
+  ARTIFACT_DOWNLOAD_ATTEMPTS: "3"
+  RESTORE_CACHE_ATTEMPTS: "3"
+  EXECUTOR_JOB_SECTION_ATTEMPTS: "3"
+  # Performs an error check after each Bash script command is executed, and exits if the previously executed command returned a non-zero exit code
+  # https://gitlab.com/gitlab-org/gitlab-runner/-/merge_requests/2671
+  FF_ENABLE_BASH_EXIT_CODE_CHECK: "true"
+  ENABLE_OPS_PIPELINE:
+    value: 'false'
+    options:
+      - 'true'
+      - 'false'
+
+# main branch in the original repo, NOT a main branch MR for a forked repo.
+# NOTE: We must make sure to exclude forked repo MRs by checking `CI_MERGE_REQUEST_SOURCE_PROJECT_ID is null,
+# because the pipeline might be in an MR against a fork's 'main' branch, and in this case this rule
+# would incorrectly trigger when the "Pipeline for Merged Results" is run for the MR.
+.if-main-original-repo: &if-main-original-repo
+  if: '$CI_COMMIT_REF_NAME == "main" && $CI_PROJECT_ID == "37966217" && $CI_MERGE_REQUEST_SOURCE_PROJECT_ID == null'
+
+.if-tag-original-repo: &if-tag-original-repo
+  if: '$CI_COMMIT_TAG && $CI_PROJECT_ID == "37966217" && $CI_COMMIT_REF_PROTECTED == "true"'
+
+# merge request, ONLY for a branch in the original repo
+.if-merge-request-original-repo: &if-merge-request-original-repo
+  if: '$CI_MERGE_REQUEST_IID && $CI_MERGE_REQUEST_SOURCE_PROJECT_ID == "37966217"'
+
+# merge request, ONLY for a branch in a forked repo
+.if-merge-request-forked-repo: &if-merge-request-forked-repo
+  if: '$CI_MERGE_REQUEST_IID && $CI_MERGE_REQUEST_SOURCE_PROJECT_ID != "37966217"'
+
+# "always" - main branch in the original repo, OR tag in original repo, OR any merge request
+# Keep in sync with rules for dont-interrupt-me
+.if-main-original-repo-or-tag-original-repo-or-merge-request:
+  &if-main-original-repo-or-tag-original-repo-or-merge-request
+  - if: !reference [.if-main-original-repo, if]
+  - if: !reference [.if-tag-original-repo, if]
+  - if: "$CI_MERGE_REQUEST_IID"
+
+.dependency-cache:
+  cache:
+    key: "vscode-fork-dependency-cache"
+    policy: pull
+    paths:
+      - "*/**/node_modules"
+
+.node-and-yarn:
+  # This job will reinstall node and yarn if they are not available from the cache, or are
+  # not the correct versions.
+  extends: .dependency-cache
+  before_script:
+    - node --version
+    - yarn --version
+    # Run a yarn install
+    - yarn --frozen-lockfile --check-files
+
+
+###################################
+#
+# PREPARE STAGE
+#
+###################################
+
+# Prevents pipeline from being interrupted by subsequent commits.
+# Pipelines on the master branch of the original repo are never interruptible.
+# MR pipelines (on original repo and forks) may be made non-interruptible by manually running the job.
+dont-interrupt-me:
+  image: alpine:edge
+  interruptible: false
+  stage: prepare
+  rules:
+    # Keep in sync with .if-main-original-repo-or-tag-original-repo-or-merge-request
+    - if: !reference [.if-main-original-repo, if]
+    - if: !reference [.if-tag-original-repo, if]
+      when: manual
+    - if: "$CI_MERGE_REQUEST_IID"
+      when: manual
+  allow_failure: true
+  variables:
+    GIT_STRATEGY: none
+  script:
+    - echo "# This job makes sure this pipeline won't be interrupted on master. It can also be triggered manually to prevent a pipeline from being interrupted. See https://docs.gitlab.com/ee/ci/yaml/#interruptible."
+
+# This is a manual job for debugging any unexpected behavior encountered while refactoring the CI config
+expose-ci-rules-variables:
+  image: alpine:edge
+  stage: prepare
+  rules: *if-main-original-repo-or-tag-original-repo-or-merge-request
+  when: manual
+  allow_failure: true
+  variables:
+    GIT_STRATEGY: none
+  script:
+    - echo "CI_COMMIT_REF_NAME = ${CI_COMMIT_REF_NAME}"
+    - echo "CI_PROJECT_ID = ${CI_PROJECT_ID}"
+    - echo "CI_MERGE_REQUEST_IID = ${CI_MERGE_REQUEST_IID}"
+    - echo "CI_MERGE_REQUEST_TITLE = ${CI_MERGE_REQUEST_TITLE}"
+    - echo "CI_MERGE_REQUEST_SOURCE_PROJECT_ID = ${CI_MERGE_REQUEST_SOURCE_PROJECT_ID}"
+    - echo "CI_COMMIT_REF_SLUG = ${CI_COMMIT_REF_SLUG}"
+    - echo "CI_PIPELINE_SOURCE = ${CI_PIPELINE_SOURCE}"
+    - echo "CI_COMMIT_TAG = ${CI_COMMIT_TAG}"
+
+# Only push the cache from this job, to save time on all other jobs.
+push-cache:
+  extends: .node-and-yarn
+  stage: prepare
+  rules:
+    - <<: *if-main-original-repo
+    # NOTE: Uncomment this line if you are working on changes to caching in a Merge Request,
+    #       so that this job will be run for MRs as well. Normally, this line should remain
+    #       commented out, to speed up MR pipelines (per the job comment above)
+    # - <<: *if-merge-request-original-repo
+  cache:
+    policy: pull-push
+  script:
+    - echo "Pushing updated cache..."
+
+generate-full-version:
+  stage: prepare
+  rules: *if-main-original-repo-or-tag-original-repo-or-merge-request
+  script:
+    - echo "$(TZ=UTC date '+%Y%m%d%H%M%S')" > TIMESTAMP
+    - if [ $CI_COMMIT_TAG ] ; then echo $CI_COMMIT_TAG > FULL_VERSION ; else echo "$(cat VERSION)-dev-$(cat TIMESTAMP)" > FULL_VERSION ; fi
+  artifacts:
+    paths:
+      - FULL_VERSION
+
+###################################
+#
+# BUILD STAGE
+#
+###################################
+
+build-and-bundle:
+  extends: .node-and-yarn
+  rules: *if-main-original-repo-or-tag-original-repo-or-merge-request
+  needs: [generate-full-version]
+  stage: build
+  script:
+    - yarn gulp core-ci
+    - yarn gulp vscode-web-min-ci
+    - echo "---------------"
+    - echo "Prepare the bundle!"
+    - echo "---------------"
+    - scripts/gl/gl_prepare_bundle.sh
+    - echo "---------------"
+    - echo "Time to bundle!"
+    - echo "---------------"
+    - scripts/gl/gl_bundle.sh
+  artifacts:
+    expire_in: "10 days"
+    paths:
+      - .build/vscode-web
+      - .build/vscode-web-dist
+
+build-server:
+  extends: .node-and-yarn
+  rules: *if-main-original-repo-or-tag-original-repo-or-merge-request
+  needs: [generate-full-version]
+  stage: build
+  script:
+    # why: we need to add to safe.directory because describing git tags in a script from within
+    # the pipeline fails - https://gitlab.com/gitlab-org/gitlab/-/issues/434664
+    - git config --global --add safe.directory $PWD
+    - scripts/gl/gl_build_server.sh
+  artifacts:
+    expire_in: "10 days"
+    paths:
+      - .build/vscode-reh-web
+
+###################################
+#
+# RELEASE STAGE
+#
+###################################
+
+.deploy-cloudflare:
+  image: alpine:3.16.8
+  tags:
+    - gitlab-org
+    - docker # hack to use private runners as shared ones don't have this tag
+  stage: release
+  id_tokens:
+    VAULT_ID_TOKEN:
+      aud: https://vault.gitlab.net
+  before_script:
+    - apk add vault libcap
+    - setcap cap_ipc_lock= /usr/sbin/vault
+    - export VAULT_TOKEN
+    - VAULT_TOKEN="$(vault write -field=token auth/${VAULT_AUTH_PATH}/login role=gitlab-org_gitlab-web-ide-vscode-fork-env-${CI_ENVIRONMENT_NAME}-ro jwt=${VAULT_ID_TOKEN})"
+
+.deploy-assets:
+  extends: .deploy-cloudflare
+  needs: [build-and-bundle]
+  before_script:
+    - !reference [.deploy-cloudflare, before_script]
+    - apk add rclone
+    - export RCLONE_CONFIG_R2_TYPE=s3
+    - export RCLONE_CONFIG_R2_PROVIDER=Cloudflare
+    - export RCLONE_CONFIG_R2_ENDPOINT="https://${CLOUDFLARE_ACCOUNT_ID}.r2.cloudflarestorage.com"
+    - export RCLONE_CONFIG_R2_ACL=private
+
+.deploy-cloudflare-worker:
+  extends: .deploy-cloudflare
+  image: node:20-alpine
+  needs: []
+  before_script:
+    - !reference [.deploy-cloudflare, before_script]
+    - export CLOUDFLARE_API_TOKEN
+    - CLOUDFLARE_API_TOKEN="$(vault kv get -field=token shared/cloudflare/api/gitlab-web-ide-vscode-fork-workers-rw)"
+    - cd cloudflare
+    - npm install
+
+# Push to bucket
+deploy-assets-staging:
+  extends: .deploy-assets
+  environment: staging
+  rules:
+    - <<: *if-tag-original-repo
+    - if: !reference [.if-merge-request-original-repo, if]
+      when: manual
+      allow_failure: true
+  script:
+    - export RCLONE_CONFIG_R2_ACCESS_KEY_ID RCLONE_CONFIG_R2_SECRET_ACCESS_KEY
+    - RCLONE_CONFIG_R2_ACCESS_KEY_ID="$(vault kv get -field=access_key_id shared/cloudflare/r2/gitlab-web-ide-vscode-fork-rw)"
+    - RCLONE_CONFIG_R2_SECRET_ACCESS_KEY="$(vault kv get -field=secret_access_key shared/cloudflare/r2/gitlab-web-ide-vscode-fork-rw)"
+    - rclone copy .build/vscode-web/out r2:gitlab-web-ide-gstg/web-ide-vscode/stable/${CI_COMMIT_SHA}/out --progress
+
+deploy-assets-production:
+  extends: .deploy-assets
+  environment: production
+  rules:
+    - <<: *if-tag-original-repo
+  script:
+    - export RCLONE_CONFIG_R2_ACCESS_KEY_ID RCLONE_CONFIG_R2_SECRET_ACCESS_KEY
+    - RCLONE_CONFIG_R2_ACCESS_KEY_ID="$(vault kv get -field=access_key_id shared/cloudflare/r2/gitlab-web-ide-vscode-fork-rw)"
+    - RCLONE_CONFIG_R2_SECRET_ACCESS_KEY="$(vault kv get -field=secret_access_key shared/cloudflare/r2/gitlab-web-ide-vscode-fork-rw)"
+    - rclone copy .build/vscode-web/out r2:gitlab-web-ide-gprd/web-ide-vscode/stable/${CI_COMMIT_SHA}/out --progress
+
+# Worker
+deploy-cloudflare-worker-staging:
+  extends: .deploy-cloudflare-worker
+  environment: staging
+  when: manual
+  allow_failure: true
+  rules:
+    - if: !reference [.if-merge-request-original-repo, if]
+      changes:
+        - cloudflare/**/*
+  script:
+    - npx wrangler deploy -e staging
+
+deploy-cloudflare-worker-production:
+  extends: .deploy-cloudflare-worker
+  environment: production
+  rules:
+    - if: !reference [.if-main-original-repo, if]
+      changes:
+        - cloudflare/**/*
+  script:
+    - npx wrangler deploy -e production
+
+publish-packages:
+  rules:
+    - <<: *if-tag-original-repo
+  needs: [generate-full-version, build-and-bundle, build-server]
+  stage: release
+  script:
+    - scripts/gl/gl_publish_packages.sh
+
+build-tools-injector:
+  image: docker:stable
+  tags: []
+  variables:
+    IMAGE_NAME: "registry.gitlab.com/gitlab-org/gitlab-web-ide-vscode-fork/web-ide-injector"
+  services:
+    - docker:dind
+  rules:
+    - *if-main-original-repo-or-tag-original-repo-or-merge-request
+  needs: [generate-full-version, build-server]
+  stage: release
+  script:
+    - apk add bash
+    - scripts/gl/gl_prepare_tools_injector_assets.sh
+    # pushes the image only on tags
+    - scripts/gl/gl_build_and_push_tools_injector.sh
+  artifacts:
+    expire_in: "10 days"
+    paths:
+      - .build/tools-injector
+
+make-release:
+  stage: release
+  image: registry.gitlab.com/gitlab-org/release-cli:latest
+  rules:
+    - <<: *if-tag-original-repo
+  script:
+    - echo "running release_job"
+  release: # See https://docs.gitlab.com/ee/ci/yaml/#release for available properties
+    tag_name: "$CI_COMMIT_TAG"
+    description: "$CI_COMMIT_TAG"
